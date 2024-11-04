@@ -1,0 +1,141 @@
+# secure_setup.yml
+---
+- name: Initial Secure Server Setup
+  hosts: nodes
+  become: yes
+  vars:
+    ansible_user: root
+    ssh_port: 22
+    ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+
+  vars_prompt:
+    - name: "ansible_user_password"
+      prompt: "Enter desired password for your ansible user"
+      private: yes
+      salt_size: 7
+    - name: "ssh_key_path"
+      prompt: "Enter path to your public SSH key"
+      private: no
+      default: "~/.ssh/id_rsa.pub"
+
+# secure_setup.yml pre_tasks section
+  pre_tasks:
+    - name: Ensure known_hosts backup is removed
+      local_action:
+        module: file
+        path: "~/.ssh/known_hosts.old"
+        state: absent
+      run_once: true
+      become: no
+
+    - name: Remove all target hosts from known_hosts
+      local_action:
+        module: shell
+        cmd: "ssh-keygen -R {{ item }}"
+      become: no
+      with_items: "{{ groups['nodes'] }}"
+      ignore_errors: yes
+      run_once: true
+
+    - name: Wait for file operations to complete
+      wait_for:
+        timeout: 2
+      delegate_to: localhost
+      become: no      # Add this line
+      run_once: true
+
+    - name: Scan new SSH host keys
+      local_action:
+        module: shell
+        cmd: "ssh-keyscan -H {{ groups['nodes'] | join(' ') }}"
+      become: no
+      register: ssh_keys
+      changed_when: true
+      run_once: true
+
+    - name: Add host keys to known_hosts
+      local_action:
+        module: lineinfile
+        path: ~/.ssh/known_hosts
+        line: "{{ item }}"
+        create: yes
+      become: no
+      with_items: "{{ ssh_keys.stdout_lines }}"
+      run_once: true
+
+    - name: Verify SSH key exists
+      local_action:
+        module: stat
+        path: "{{ ssh_key_path | expanduser }}"
+      become: no  # Explicitly disable sudo
+      register: ssh_key_file
+      delegate_to: localhost
+
+    - name: Fail if SSH key not found
+      fail:
+        msg: "SSH key not found at {{ ssh_key_path }}. Please generate one with 'ssh-keygen -t rsa' or provide correct path."
+      when: not ssh_key_file.stat.exists
+      delegate_to: localhost
+      become: no
+
+  handlers:
+    - name: Restart sshd
+      service:
+        name: ssh
+        state: restarted
+
+  tasks:
+    - name: Create ansible user with password
+      user:
+        name: ansible
+        groups: sudo
+        shell: /bin/bash
+        password: "{{ ansible_user_password | password_hash('sha512') }}"
+
+    - name: Create .ssh directory
+      file:
+        path: /home/ansible/.ssh
+        state: directory
+        mode: '0700'
+        owner: ansible
+        group: ansible
+
+    - name: Copy SSH key
+      authorized_key:
+        user: ansible
+        key: "{{ lookup('file', ssh_key_path) }}"
+        state: present
+
+    - name: Configure sudoers
+      copy:
+        dest: /etc/sudoers.d/ansible
+        content: "ansible ALL=(ALL) NOPASSWD:ALL\n"
+        mode: '0440'
+
+    - name: Update SSH security config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^PermitRootLogin', line: 'PermitRootLogin no' }
+        - { regexp: '^PasswordAuthentication', line: 'PasswordAuthentication no' }
+        - { regexp: '^ChallengeResponseAuthentication', line: 'ChallengeResponseAuthentication no' }
+        - { regexp: '^PubkeyAuthentication', line: 'PubkeyAuthentication yes' }
+        - { regexp: '^PermitEmptyPasswords', line: 'PermitEmptyPasswords no' }
+        - { regexp: '^UsePAM', line: 'UsePAM yes' }
+      notify: Restart sshd
+
+    - name: Ensure SSH service is running and enabled
+      service:
+        name: ssh
+        state: started
+        enabled: yes
+
+    - name: Wait for SSH to restart
+      wait_for:
+        port: "{{ ssh_port }}"
+        state: started
+        delay: 5
+        timeout: 60

@@ -1,0 +1,7 @@
+
+[nodes]
+XXX.XXX.XXX.XXX
+XX.XXX.XXX.XX
+
+[nodes:vars]
+ansible_user=root
